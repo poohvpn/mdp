@@ -16,9 +16,13 @@ func dialTcpDatagram(addr *net.TCPAddr, id uint32, ob Obfuscator) (conn *tcpData
 	conn = &tcpDatagram{
 		Conn: pooh.NewConn(ob.ObfuscateStreamConn(tcpConn), true),
 	}
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
 	err = conn.Conn.WriteUint32(id)
 	if err != nil {
-		_ = conn.Close()
 		return
 	}
 	return
@@ -58,41 +62,41 @@ func (td *tcpDatagram) Close() error {
 	return td.Conn.Close()
 }
 
-var _ net.Conn = &serverWriteConn{}
+var _ net.Conn = &writeOnlyConn{}
 
-type serverWriteConn struct {
+type writeOnlyConn struct {
 	remote     net.Addr
 	packetConn net.PacketConn
 }
 
-func (p *serverWriteConn) Read(b []byte) (n int, err error) {
-	panic("shouldn't read from serverWriteConn")
+func (p *writeOnlyConn) Read(b []byte) (n int, err error) {
+	panic("shouldn't read from writeOnlyConn")
 }
 
-func (p *serverWriteConn) Write(b []byte) (n int, err error) {
+func (p *writeOnlyConn) Write(b []byte) (n int, err error) {
 	return p.packetConn.WriteTo(b, p.remote)
 }
 
-func (p *serverWriteConn) Close() error {
+func (p *writeOnlyConn) Close() error {
 	return nil
 }
 
-func (p *serverWriteConn) LocalAddr() net.Addr {
+func (p *writeOnlyConn) LocalAddr() net.Addr {
 	return p.packetConn.LocalAddr()
 }
 
-func (p *serverWriteConn) RemoteAddr() net.Addr {
+func (p *writeOnlyConn) RemoteAddr() net.Addr {
 	return p.remote
 }
 
-func (p *serverWriteConn) SetDeadline(t time.Time) error {
+func (p *writeOnlyConn) SetDeadline(t time.Time) error {
 	return nil
 }
 
-func (p *serverWriteConn) SetReadDeadline(t time.Time) error {
+func (p *writeOnlyConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-func (p *serverWriteConn) SetWriteDeadline(t time.Time) error {
+func (p *writeOnlyConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }

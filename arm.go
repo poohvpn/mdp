@@ -1,13 +1,14 @@
 package mdp
 
 import (
+	"encoding/binary"
 	"math/rand"
 	"net"
 	"reflect"
 	"time"
 
 	"github.com/poohvpn/icmdp"
-	"github.com/rs/zerolog/log"
+	"github.com/poohvpn/pooh"
 )
 
 func init() {
@@ -15,52 +16,13 @@ func init() {
 }
 
 const (
-	idSize     = 4
-	natTimeout = 30 * time.Second
-	queueSize  = 1024
+	sessionIDSize = 4
+	nodeIDSize    = 4
+	natTimeout    = 30 * time.Second
+	queueSize     = 1024
 )
 
-func endpointIndex(conn net.Conn) uint64 {
-	index := uint64(0)
-	local := conn.LocalAddr()
-	remote := conn.RemoteAddr()
-	network := remote.Network()
-	switch network {
-	case "tcp":
-		index = uint64(0x6)
-	case "udp":
-		index = uint64(0x11)
-	case "icmdp":
-		index = uint64(0x1)
-	default:
-		log.Panic().Str("network", network).Msg("unknown network")
-	}
-	index <<= 1
-	switch v := local.(type) {
-	case *net.TCPAddr:
-		index += uint64(v.Port)
-	case *net.UDPAddr:
-		index += uint64(v.Port)
-	case *icmdp.Addr:
-		index += uint64(v.Seq)
-	default:
-		log.Panic().Str("local.type", reflect.TypeOf(local).String()).Msg("unknown local address type")
-	}
-	index <<= 16
-	switch v := remote.(type) {
-	case *net.TCPAddr:
-		index += uint64(v.Port)
-	case *net.UDPAddr:
-		index += uint64(v.Port)
-	case *icmdp.Addr:
-		index += uint64(v.ID) // mainly for icmdp server side to represent client port
-	default:
-		log.Panic().Str("remote.type", reflect.TypeOf(remote).String()).Msg("unknown remote address type")
-	}
-	return index
-}
-
-type rawPacket struct {
+type inputPacket struct {
 	Addr *Addr
 	Data []byte
 }
@@ -85,4 +47,70 @@ func (o nopObfuscator) ObfuscateDatagramConn(conn net.Conn) net.Conn {
 
 func (o nopObfuscator) ObfuscateStreamConn(conn net.Conn) net.Conn {
 	return conn
+}
+
+func readStreamIDs(conn pooh.Conn) (sid, nid uint32, err error) {
+	sid, err = conn.Uint32()
+	if err != nil {
+		return
+	}
+	nid, err = conn.Uint32()
+	if err != nil {
+		return
+	}
+	return
+}
+
+func connIndex(conn net.Conn) uint64 {
+	switch local := conn.LocalAddr().(type) {
+	case *net.TCPAddr:
+		remote := conn.RemoteAddr().(*net.TCPAddr)
+		return endpointIndex(
+			pooh.IsIPv4(local.IP),
+			endpointTCP,
+			uint16(local.Port),
+			uint16(remote.Port),
+		)
+	case *net.UDPAddr:
+		remote := conn.RemoteAddr().(*net.UDPAddr)
+		return endpointIndex(
+			pooh.IsIPv4(local.IP),
+			endpointUDP,
+			uint16(local.Port),
+			uint16(remote.Port),
+		)
+	case *icmdp.Addr:
+		remote := conn.RemoteAddr().(*icmdp.Addr)
+		return endpointIndex(
+			pooh.IsIPv4(local.IP),
+			endpointICMDP,
+			local.Seq,
+			remote.ID, // mainly for icmdp server side to represent client port
+		)
+	default:
+		panic(reflect.TypeOf(local).String())
+	}
+}
+
+func forwardIndex(sid, nid uint32) uint64 {
+	return uint64(sid)<<32 + uint64(nid)
+}
+
+func readPacketIDs(p []byte) (sid, nid uint32, data []byte) {
+	pLen := len(p)
+	return binary.BigEndian.Uint32(p[pLen-4:]), binary.BigEndian.Uint32(p[pLen-8:]), data[:pLen-8]
+}
+
+func endpointIndex(ipv4 bool, typ endpointType, localPort, remotePort uint16) uint64 {
+	i := uint64(4)
+	if !ipv4 {
+		i = 6
+	}
+	i <<= 8
+	i += uint64(typ)
+	i <<= 16
+	i += uint64(localPort)
+	i <<= 16
+	i += uint64(remotePort)
+	return i
 }

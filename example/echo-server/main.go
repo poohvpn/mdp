@@ -20,7 +20,7 @@ func main() {
 		}
 		log.Info().
 			Str("addr", addr.String()).
-			Uint32("id", addr.(*mdp.Addr).ID()).
+			Uint32("id", addr.(*mdp.Addr).SessionID()).
 			Bytes("data", buf[:nr]).
 			Msg("ReadFrom")
 		nw, err := server.WriteTo(buf[:nr], addr)

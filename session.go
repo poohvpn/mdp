@@ -13,47 +13,130 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func newSession() *session {
-	return &session{
-		id:       rand.Uint32(),
-		packetCh: make(chan rawPacket, queueSize),
+type Config struct {
+	SessionID      uint32
+	NodeID         uint32
+	ForwardNodeIDs []uint32
+	DualStackAddr  DualStackAddr
+	Threads        int
+	DisableICMDP   bool
+	DisableTCP     bool
+	DisableUDP     bool
+	Obfuscator     Obfuscator
+}
+
+func (c *Config) def() Config {
+	for c.SessionID == 0 {
+		c.SessionID = rand.Uint32()
 	}
+	if c.Threads <= 0 {
+		c.Threads = 1
+	} else if c.Threads > 32 {
+		c.Threads = 32
+	}
+	if c.Obfuscator == nil {
+		c.Obfuscator = nopObfuscator{}
+	}
+	if c.DisableTCP && c.DisableUDP && c.DisableICMDP {
+		c.DisableUDP = false
+	}
+	return *c
+}
+
+func newSession(config Config) *session {
+	s := &session{
+		config: config.def(),
+	}
+	return s
 }
 
 type session struct {
-	id         uint32
-	localAddr  *Addr
-	remoteAddr *Addr
-	lastSeen   time.Time
-	endpoints  sync.Map
-	packetCh   chan rawPacket
-	closeOnce  pooh.Once
-	closeErr   error
-	serverSide bool
+	config       Config
+	srcAddr      *Addr
+	srcEndpoints sync.Map // uint64 -> *endpoint
+	srcInputCh   chan *inputPacket
+	dstAddr      *Addr
+	dstEndpoints sync.Map // uint64 -> *endpoint
+	dstInputCh   chan *inputPacket
+	activeAt     time.Time
+	closeOnce    pooh.ErrorOnce
 }
 
 // todo remove tcp conn itself from session
 
-func (s *session) upsert(conn net.Conn) *endpoint {
-	if s.serverSide && s.remoteAddr == nil {
-		s.remoteAddr = fromNetAddr(conn.RemoteAddr())
-		s.remoteAddr.sess = s
+func (s *session) setSrcInputCh(ch chan *inputPacket) *session {
+	if ch == nil {
+		ch = make(chan *inputPacket, queueSize)
 	}
-	s.lastSeen = time.Now()
-	v, exist := s.endpoints.LoadOrStore(endpointIndex(conn), &endpoint{
-		super: s,
-	})
-	ep := v.(*endpoint)
-	if !exist {
-		ep.conn = conn
-		go ep.run()
-	}
-	return ep
+	s.srcInputCh = ch
+	return s
 }
 
-func (s *session) mostRecentEndpoint() (res *endpoint) {
+func (s *session) addForwardEndpoints() *session {
+	if s.dstInputCh == nil {
+		s.dstInputCh = make(chan *inputPacket, queueSize)
+	}
+	config := s.config
+	add := func(typ endpointType, addr DualStackAddr, threadIndex uint16) {
+		if pooh.IsIPv4(addr.IP4) {
+			s.addForwardEndpoint(typ, &Addr{
+				IP:   addr.IP4,
+				Port: addr.Port,
+				sess: s,
+			}, threadIndex)
+		}
+		if pooh.IsIPv6(addr.IP6) {
+			s.addForwardEndpoint(typ, &Addr{
+				IP:   addr.IP6,
+				Port: addr.Port,
+				Zone: addr.Zone,
+				sess: s,
+			}, threadIndex)
+		}
+	}
+	for i := 0; i < config.Threads; i++ {
+		if !config.DisableUDP {
+			add(endpointUDP, config.DualStackAddr, uint16(i))
+		}
+		if !config.DisableTCP {
+			add(endpointTCP, config.DualStackAddr, uint16(i))
+		}
+		if !config.DisableICMDP {
+			add(endpointICMDP, config.DualStackAddr, uint16(i))
+		}
+	}
+	return s
+}
+
+func (s *session) upsertInputConn(typ endpointType, conn net.Conn) *endpoint {
+	if s.srcAddr == nil {
+		s.setInputAddr(conn.RemoteAddr())
+	}
+	index := connIndex(conn)
+	v, ok := s.srcEndpoints.Load(index) // fast load
+	if !ok {
+		v, ok = s.srcEndpoints.LoadOrStore(index, &endpoint{
+			index: index,
+			typ:   typ,
+			addr:  s.srcAddr,
+		})
+		ep := v.(*endpoint)
+		if !ok {
+			ep.conn = conn
+			go ep.inputLoop()
+		}
+	}
+	s.activeAt = time.Now()
+	return v.(*endpoint)
+}
+
+func (s *session) mostRecentEndpoint(dst bool) (res *endpoint) {
+	eps := &s.srcEndpoints
+	if dst {
+		eps = &s.dstEndpoints
+	}
 	var t time.Time
-	s.endpoints.Range(func(_, v interface{}) bool {
+	eps.Range(func(_, v interface{}) bool {
 		ep := v.(*endpoint)
 		if ep.lastRecv.After(t) || t == (time.Time{}) {
 			t = ep.lastRecv
@@ -64,6 +147,19 @@ func (s *session) mostRecentEndpoint() (res *endpoint) {
 	return
 }
 
+func (s *session) addForwardEndpoint(typ endpointType, remote *Addr, threadIndex uint16) {
+	index := endpointIndex(pooh.IsIPv4(remote.IP), typ, threadIndex, uint16(remote.Port))
+	ep := &endpoint{
+		index: index,
+		typ:   typ,
+		dst:   true,
+		addr:  remote,
+	}
+	s.dstEndpoints.Store(index, ep)
+	go ep.run()
+}
+
+
 func (s *session) dial(network string, remote *Addr, ob Obfuscator) (err error) {
 	var conn net.Conn
 	switch network {
@@ -72,7 +168,7 @@ func (s *session) dial(network string, remote *Addr, ob Obfuscator) (err error) 
 			IP:   remote.IP,
 			Port: remote.Port,
 			Zone: remote.Zone,
-		}, s.id, ob)
+		}, s.sid, ob)
 	case "udp4", "udp6":
 		conn, err = net.DialUDP("udp", nil, &net.UDPAddr{
 			IP:   remote.IP,
@@ -108,45 +204,34 @@ func (s *session) dial(network string, remote *Addr, ob Obfuscator) (err error) 
 	switch network {
 	case "udp4", "udp6", "icmdp4", "icmdp6":
 		conn = ob.ObfuscateDatagramConn(conn)
-		conn = &clientDatagramConn{
-			Conn: conn,
-			id:   s.id,
-		}
 	}
 	if s.localAddr == nil {
-		s.setLocalAddr(conn.LocalAddr())
+		s.setInputAddr(conn.LocalAddr())
 	}
-	if s.remoteAddr == nil {
-		s.setRemoteAddr(remote)
+	if s.srcAddr == nil {
+		s.setInputAddr(remote)
 	}
 
-	// append new conn to endpoints
+	// append new conn to srcEndpoints
 	ep := &endpoint{
 		super: s,
 		conn:  conn,
 	}
-	s.endpoints.Store(endpointIndex(conn), ep)
+	s.srcEndpoints.Store(connIndex(conn), ep)
 	go ep.run()
 	return
 }
 
-func (s *session) send(data []byte) error {
-	if debug {
-		log.Debug().Uint32("id", s.id).Bytes("data", data).Msg("session.send")
+func (s *session) input(data []byte, dst bool) bool {
+	ch, addr := s.srcInputCh, s.srcAddr
+	if dst {
+		ch, addr = s.dstInputCh, s.dstAddr
 	}
-	ep := s.mostRecentEndpoint()
-	if ep == nil {
-		if debug {
-			log.Warn().Str("addr", s.remoteAddr.String()).Msg("no most recent endpoint")
-		}
-		return errors.New("noa available endpoint to send")
-	}
-	return ep.send(data)
-}
-
-func (s *session) recv(data []byte) (ok bool) {
 	if debug {
-		log.Debug().Uint32("id", s.id).Bytes("data", data).Msg("session.recv")
+		log.Debug().
+			Uint32("sid", s.config.SessionID).
+			Bytes("data", data).
+			Msg("session.input")
 	}
 	if len(data) == 0 {
 		return true
@@ -154,40 +239,77 @@ func (s *session) recv(data []byte) (ok bool) {
 	select {
 	case <-s.closeOnce.Wait():
 		return false
-	case s.packetCh <- rawPacket{Addr: s.remoteAddr, Data: data}:
+	case ch <- &inputPacket{Addr: addr, Data: data}:
+		return true
 	}
-	return true
 }
 
-func (s *session) close() {
+func (s *session) output(data []byte, dst bool) error {
 	if debug {
-		log.Debug().Uint32("id", s.id).Msg("session.close")
+		log.Debug().
+			Uint32("sid", s.config.SessionID).
+			Uint32("nid", s.config.NodeID).
+			Bytes("data", data).
+			Msg("session.output")
 	}
-	errs := new(multierror.Error)
-	s.endpoints.Range(func(_, v interface{}) bool {
-		ep := v.(*endpoint)
-		errs = multierror.Append(errs, ep.conn.Close())
-		return true
-	})
-	s.closeErr = errs.ErrorOrNil()
-	return
+	ep := s.mostRecentEndpoint(dst)
+	if ep == nil {
+		if debug {
+			log.Warn().Str("addr", s.srcAddr.String()).Msg("no most recent endpoint")
+		}
+		return errors.New("no available endpoint to output")
+	}
+	packet := make([]byte, 0, len(data)+sessionIDSize+nodeIDSize)
+	packet = append(packet, data...)
+	packet = append(packet, pooh.Uint322Bytes(s.config.NodeID)...)
+
+	return ep.send(data)
+}
+
+func (s *session) forward(dst bool) {
+	ch := s.srcInputCh
+	if dst {
+		ch = s.dstInputCh
+	}
+	for {
+		select {
+		case <-s.closeOnce.Wait():
+			return
+		case p := <-ch:
+			// write to forward endpoints
+			err := s.output(p.Data, !dst)
+			if debug && err != nil {
+				log.Debug().Err(err).Msg("forward output")
+			}
+		}
+	}
 }
 
 func (s *session) Close() error {
-	s.closeOnce.Do(s.close)
-	return s.closeErr
+	return s.closeOnce.Do(func() error {
+		if debug {
+			log.Debug().Uint32("sid", s.config.SessionID).Msg("session.close")
+		}
+		errs := new(multierror.Error)
+		s.srcEndpoints.Range(func(_, v interface{}) bool {
+			ep := v.(*endpoint)
+			errs = multierror.Append(errs, ep.conn.Close())
+			return true
+		})
+		return errs.ErrorOrNil()
+	})
 }
 
-func (s *session) setLocalAddr(netAddr net.Addr) *session {
+func (s *session) setInputAddr(netAddr net.Addr) *session {
 	addr := fromNetAddr(netAddr)
 	addr.sess = s
-	s.localAddr = addr
+	s.srcAddr = addr
 	return s
 }
 
-func (s *session) setRemoteAddr(netAddr net.Addr) *session {
+func (s *session) setForwardAddr(netAddr net.Addr) *session {
 	addr := fromNetAddr(netAddr)
 	addr.sess = s
-	s.remoteAddr = addr
+	s.dstAddr = addr
 	return s
 }

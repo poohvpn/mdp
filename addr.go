@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	"github.com/poohvpn/icmdp"
+	"github.com/poohvpn/pooh"
 	"github.com/rs/zerolog/log"
 )
 
@@ -23,10 +24,6 @@ func (a *Addr) String() string {
 		Port: a.Port,
 		Zone: a.Zone,
 	}).String()
-}
-
-func (a *Addr) ID() uint32 {
-	return a.sess.id
 }
 
 func fromNetAddr(netAddr net.Addr) *Addr {
@@ -52,4 +49,15 @@ func fromNetAddr(netAddr net.Addr) *Addr {
 		log.Panic().Str("addr.(type)", reflect.TypeOf(netAddr).String()).Msg("unknown addr type")
 	}
 	return addr
+}
+
+type DualStackAddr struct {
+	IP4  net.IP
+	IP6  net.IP
+	Port int
+	Zone string
+}
+
+func (a *DualStackAddr) invalid() bool {
+	return !(pooh.IsIPv4(a.IP4) || pooh.IsIPv6(a.IP6)) || a.Port == 0
 }

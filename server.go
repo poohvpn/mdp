@@ -1,7 +1,7 @@
 package mdp
 
 import (
-	"encoding/binary"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -11,33 +11,22 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type ServerConfig struct {
-	Port       int
-	Obfuscator Obfuscator
-}
-
-func (c *ServerConfig) fix() {
-	if c.Obfuscator == nil {
-		c.Obfuscator = nopObfuscator{}
-	}
-}
-
-func Listen(config ServerConfig) (s *Server, err error) {
-	config.fix()
+func Listen(port int) (s *Server, err error) {
 	s = &Server{
-		config: config,
-		sess: newSession().setLocalAddr(&Addr{
-			Port: config.Port,
-		}),
+		session: newSession(Config{}).
+			setSrcInputCh(nil).
+			setInputAddr(&Addr{
+				Port: port,
+			}),
 	}
 	s.tcpListener, err = net.ListenTCP("tcp", &net.TCPAddr{
-		Port: config.Port,
+		Port: port,
 	})
 	if err != nil {
 		return
 	}
 	s.udpListener, err = net.ListenUDP("udp", &net.UDPAddr{
-		Port: config.Port,
+		Port: port,
 	})
 	if err != nil {
 		return
@@ -53,7 +42,9 @@ func Listen(config ServerConfig) (s *Server, err error) {
 		err = nil
 	}
 
-	go icmdp.DisableLinuxEcho()
+	if s.icmpV4Conn != nil || s.icmpV6Conn != nil {
+		go icmdp.DisableLinuxEcho()
+	}
 	go s.acceptTcpConn(s.tcpListener)
 	go s.handlePacketConn(s.udpListener)
 	go s.handlePacketConn(s.icmpV4Conn)
@@ -64,26 +55,24 @@ func Listen(config ServerConfig) (s *Server, err error) {
 var _ net.PacketConn = &Server{}
 
 type Server struct {
-	config      ServerConfig
-	sess        *session
-	tcpListener *net.TCPListener
-	udpListener *net.UDPConn
-	icmpV4Conn  *icmdp.Conn
-	icmpV6Conn  *icmdp.Conn
-
-	nat       sync.Map // uint32 -> *session
-	closeOnce pooh.Once
-	err       error
+	session         *session
+	tcpListener     *net.TCPListener
+	udpListener     *net.UDPConn
+	icmpV4Conn      *icmdp.Conn
+	icmpV6Conn      *icmdp.Conn
+	forwardNodes    sync.Map // uint32 -> DualStackAddr
+	inputSessions   sync.Map // uint32 -> *session
+	forwardSessions sync.Map // uint64 -> *session
+	closeOnce       pooh.ErrorOnce
 }
 
 func (s *Server) acceptTcpConn(listener *net.TCPListener) {
 	for {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
-			s.err = err
 			return
 		}
-		go s.handleTcpConn(s.config.Obfuscator.ObfuscateStreamConn(conn))
+		go s.handleTcpConn(s.session.config.Obfuscator.ObfuscateStreamConn(conn))
 	}
 }
 
@@ -97,20 +86,29 @@ func (s *Server) handleTcpConn(tcpConn net.Conn) {
 	conn := &tcpDatagram{
 		Conn: pooh.NewConn(tcpConn, true),
 	}
-	id, err := conn.Uint32()
+	sid, nid, err := readStreamIDs(conn)
 	if err != nil {
 		return
 	}
-
-	s.loadOrStoreSession(id).upsert(conn)
-	// todo may be remove ep from s.nat here
+	sess, ok := s.upsertSession(sid, nid)
+	if !ok {
+		return
+	}
+	sess.upsertInputConn(endpointTCP, conn)
 }
 
 func (s *Server) handlePacketConn(conn net.PacketConn) {
+	var typ endpointType
+	switch conn.(type) {
+	case *net.UDPConn:
+		typ = endpointUDP
+	case *icmdp.Conn:
+		typ = endpointICMDP
+	}
 	if pooh.IsNil(conn) {
 		return
 	}
-	conn = s.config.Obfuscator.ObfuscatePacketConn(conn)
+	conn = s.session.config.Obfuscator.ObfuscatePacketConn(conn)
 	buf := make([]byte, pooh.BufferSize)
 	for {
 		if s.closeOnce.Done() {
@@ -118,52 +116,83 @@ func (s *Server) handlePacketConn(conn net.PacketConn) {
 		}
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
-			s.err = err
 			return
 		}
-		if n < idSize {
+		if n < sessionIDSize+nodeIDSize {
 			continue
 		}
-		go s.handlePacket(pooh.Duplicate(buf[:n]), addr, conn)
+		go s.handlePacket(pooh.Duplicate(buf[:n]), addr, typ, conn)
 	}
 }
 
-func (s *Server) handlePacket(p []byte, raddr net.Addr, conn net.PacketConn) {
-	data, id := p[:len(p)-idSize], binary.BigEndian.Uint32(p[len(p)-idSize:])
-	sess := s.loadOrStoreSession(id)
-	ep := sess.upsert(&serverWriteConn{
+func (s *Server) handlePacket(p []byte, raddr net.Addr, typ endpointType, conn net.PacketConn) {
+	woc := &writeOnlyConn{
 		remote:     raddr,
 		packetConn: conn,
-	})
+	}
+	sid, nid, data := readPacketIDs(p)
+	sess, ok := s.upsertSession(sid, nid)
+	if !ok {
+		return
+	}
+	ep := sess.upsertInputConn(typ, woc)
 	ep.recv(data)
 }
 
-func (s *Server) loadOrStoreSession(id uint32) *session {
-	v, _ := s.nat.LoadOrStore(id, &session{
-		id:         id,
-		packetCh:   s.sess.packetCh,
-		serverSide: true,
-	})
-	return v.(*session)
+func (s *Server) upsertSession(sid, nid uint32) (*session, bool) {
+	if nid == s.session.config.NodeID { // input
+		v, ok := s.inputSessions.Load(sid) // fast load
+		if !ok {
+			v, _ = s.inputSessions.LoadOrStore(sid,
+				newSession(Config{
+					SessionID:  sid,
+					NodeID:     s.session.config.NodeID,
+					Obfuscator: s.session.config.Obfuscator,
+				}).setSrcInputCh(s.session.srcInputCh))
+		}
+		return v.(*session), true
+	}
+
+	// frontward forward
+	index := forwardIndex(sid, nid)
+	v, ok := s.forwardSessions.Load(index) // fast load
+	if !ok {
+		v, ok = s.forwardNodes.Load(nid)
+		if !ok {
+			return nil, false
+		}
+		addr := v.(DualStackAddr)
+		v, ok = s.forwardSessions.LoadOrStore(index,
+			newSession(Config{
+				SessionID:     sid,
+				NodeID:        nid,
+				DualStackAddr: addr,
+				Obfuscator:    s.session.config.Obfuscator,
+			}).setSrcInputCh(nil))
+		if !ok {
+			v.(*session).addForwardEndpoints()
+		}
+	}
+	return v.(*session), true
 }
 
-// todo clean up s.nat
+// todo clean up s.inputSessions
 
 func (s *Server) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	if s.err != nil {
-		return 0, nil, s.err
+	if s.closeOnce.Done() {
+		return 0, nil, io.EOF
 	}
-	packet := <-s.sess.packetCh
+	packet := <-s.session.srcInputCh
 	return copy(p, packet.Data), packet.Addr, nil
 }
 
 func (s *Server) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if s.err != nil {
-		return 0, s.err
+	if s.closeOnce.Done() {
+		return 0, io.EOF
 	}
 	n = len(p)
 	a := addr.(*Addr)
-	err = a.sess.send(p)
+	err = a.sess.output(p, false)
 	return
 }
 
@@ -172,14 +201,13 @@ func (s *Server) close() error {
 }
 
 func (s *Server) Close() error {
-	s.closeOnce.Do(func() {
-		s.err = s.close()
+	return s.closeOnce.Do(func() error {
+		return pooh.Close(s.tcpListener, s.udpListener, s.icmpV4Conn, s.icmpV6Conn)
 	})
-	return s.err
 }
 
 func (s *Server) LocalAddr() net.Addr {
-	return s.sess.localAddr
+	return s.session.srcAddr
 }
 
 func (s *Server) SetDeadline(t time.Time) error {
@@ -192,4 +220,28 @@ func (s *Server) SetReadDeadline(t time.Time) error {
 
 func (s *Server) SetWriteDeadline(t time.Time) error {
 	panic("implement me")
+}
+
+func (s *Server) SetNodeID(id uint32) *Server {
+	s.session.config.NodeID = id
+	return s
+}
+
+func (s *Server) SetObfuscator(ob Obfuscator) *Server {
+	s.session.config.Obfuscator = ob
+	return s
+}
+
+func (s *Server) SetForwardNode(id uint32, addr DualStackAddr) *Server {
+	if addr.invalid() {
+		s.forwardNodes.Delete(id)
+	} else {
+		s.forwardNodes.Store(id, addr)
+	}
+	return s
+}
+
+func (s *Server) DeleteForwardNode(id uint32) *Server {
+	s.forwardNodes.Delete(id)
+	return s
 }

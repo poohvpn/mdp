@@ -1,6 +1,7 @@
 
-upgrade:
+up:
 	go get -u github.com/poohvpn/pooh
+	go mod tidy
 
 echo-server:
 	mkdir -p bin
