@@ -6,7 +6,9 @@ import (
 )
 
 func main() {
-	server, err := mdp.Listen(1989)
+	server, err := mdp.Listen(mdp.ServerConfig{
+		Port: 1989,
+	})
 	if err != nil {
 		panic(err)
 	}

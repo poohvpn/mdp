@@ -10,11 +10,11 @@ import (
 
 func main() {
 	client, err := mdp.NewClient(mdp.ClientConfig{
-		IP4:        net.IPv4(127, 0, 0, 1),
-		Port:       1989,
-		Threads:    1,
-		DisableTCP: true,
-		DisableUDP: true,
+		IP4:          net.IPv4(127, 0, 0, 1),
+		Port:         1989,
+		Threads:      1,
+		DisableTCP:   true,
+		DisableICMDP: true,
 	})
 	if err != nil {
 		panic(err)

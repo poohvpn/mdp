@@ -43,19 +43,8 @@ func (e *endpoint) recv(data []byte) (ok bool) {
 
 func (e *endpoint) run() {
 	switch conn := e.conn.(type) {
-	case *tcpDatagram:
-		defer e.conn.Close()
-		for {
-			data, err := conn.ReadPacket()
-			if err != nil {
-				return
-			}
-			if !e.recv(data) {
-				return
-			}
-		}
 	case *serverWriteConn:
-		// does not need to handle server side PacketConn
+		// does not need to handle server side PacketConn, which is already received by PacketConn loop
 		return
 	default:
 		defer e.conn.Close()

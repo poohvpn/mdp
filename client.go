@@ -12,14 +12,15 @@ import (
 var _ net.Conn = &Client{}
 
 type ClientConfig struct {
-	IP4          net.IP `json:"ip4"`
-	IP6          net.IP `json:"ip6"`
-	Port         int    `json:"port"`
-	Zone         string `json:"zone"`
-	Threads      int    `json:"threads"`
-	DisableICMDP bool   `json:"disable_icmdp"`
-	DisableTCP   bool   `json:"disable_tcp"`
-	DisableUDP   bool   `json:"disable_udp"`
+	IP4          net.IP
+	IP6          net.IP
+	Port         int
+	Zone         string
+	Threads      int
+	DisableICMDP bool
+	DisableTCP   bool
+	DisableUDP   bool
+	Obfuscator   Obfuscator
 }
 
 func (c *ClientConfig) fix() {
@@ -27,6 +28,9 @@ func (c *ClientConfig) fix() {
 		c.Threads = 1
 	} else if c.Threads > 32 {
 		c.Threads = 32
+	}
+	if c.Obfuscator == nil {
+		c.Obfuscator = nopObfuscator{}
 	}
 }
 
@@ -77,7 +81,7 @@ func (c *Client) tryDialAll() error {
 		}
 		for _, network := range networks {
 			network += "4"
-			err := c.sess.dial(network, addr)
+			err := c.sess.dial(network, addr, c.config.Obfuscator)
 			if err != nil {
 				log.Warn().Err(err).Str("network", network).Msg("mdp: dial")
 				lastErr = err
@@ -94,7 +98,7 @@ func (c *Client) tryDialAll() error {
 		}
 		for _, network := range networks {
 			network += "6"
-			err := c.sess.dial(network, addr)
+			err := c.sess.dial(network, addr, c.config.Obfuscator)
 			if err != nil {
 				log.Warn().Err(err).Str("network", network).Msg("mdp: dial")
 				lastErr = err
@@ -151,12 +155,12 @@ func (c *Client) ID() uint32 {
 	return c.sess.id
 }
 
-type clientPacketConn struct {
+type clientDatagramConn struct {
 	net.Conn
 	id uint32
 }
 
-func (c *clientPacketConn) Write(p []byte) (n int, err error) {
+func (c *clientDatagramConn) Write(p []byte) (n int, err error) {
 	n = len(p)
 	_, err = c.Conn.Write(append(p, pooh.Uint322Bytes(c.id)...))
 	return

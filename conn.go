@@ -8,17 +8,17 @@ import (
 	"github.com/poohvpn/pooh"
 )
 
-func dialTcpDatagram(addr *net.TCPAddr, id uint32) (pos *tcpDatagram, err error) {
+func dialTcpDatagram(addr *net.TCPAddr, id uint32, ob Obfuscator) (conn *tcpDatagram, err error) {
 	tcpConn, err := net.DialTCP("tcp", nil, addr)
 	if err != nil {
 		return
 	}
-	pos = &tcpDatagram{
-		Conn: pooh.NewConn(tcpConn, true),
+	conn = &tcpDatagram{
+		Conn: pooh.NewConn(ob.ObfuStreamConn(tcpConn), true),
 	}
-	err = pos.Conn.WriteUint32(id)
+	err = conn.Conn.WriteUint32(id)
 	if err != nil {
-		_ = pos.Close()
+		_ = conn.Close()
 		return
 	}
 	return
@@ -33,20 +33,12 @@ type tcpDatagram struct {
 
 // todo reconnect
 
-func (td *tcpDatagram) ReadPacket() (data []byte, err error) {
+func (td *tcpDatagram) Read(b []byte) (n int, err error) {
 	length, err := td.Uint16()
 	if err != nil {
 		return
 	}
-	data, err = td.Bytes(int(length))
-	if err != nil {
-		return
-	}
-	return
-}
-
-func (td *tcpDatagram) Read(b []byte) (n int, err error) {
-	data, err := td.ReadPacket()
+	data, err := td.Bytes(int(length))
 	if err != nil {
 		return
 	}

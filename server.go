@@ -11,20 +11,33 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func Listen(port int) (s *Server, err error) {
+type ServerConfig struct {
+	Port       int
+	Obfuscator Obfuscator
+}
+
+func (c *ServerConfig) fix() {
+	if c.Obfuscator == nil {
+		c.Obfuscator = nopObfuscator{}
+	}
+}
+
+func Listen(config ServerConfig) (s *Server, err error) {
+	config.fix()
 	s = &Server{
+		config: config,
 		sess: newSession().setLocalAddr(&Addr{
-			Port: port,
+			Port: config.Port,
 		}),
 	}
 	s.tcpListener, err = net.ListenTCP("tcp", &net.TCPAddr{
-		Port: port,
+		Port: config.Port,
 	})
 	if err != nil {
 		return
 	}
-	s.udpConn, err = net.ListenUDP("udp", &net.UDPAddr{
-		Port: port,
+	s.udpListener, err = net.ListenUDP("udp", &net.UDPAddr{
+		Port: config.Port,
 	})
 	if err != nil {
 		return
@@ -42,7 +55,7 @@ func Listen(port int) (s *Server, err error) {
 
 	go icmdp.DisableLinuxEcho()
 	go s.acceptTcpConn(s.tcpListener)
-	go s.handlePacketConn(s.udpConn)
+	go s.handlePacketConn(s.udpListener)
 	go s.handlePacketConn(s.icmpV4Conn)
 	go s.handlePacketConn(s.icmpV6Conn)
 	return
@@ -51,9 +64,10 @@ func Listen(port int) (s *Server, err error) {
 var _ net.PacketConn = &Server{}
 
 type Server struct {
+	config      ServerConfig
 	sess        *session
 	tcpListener *net.TCPListener
-	udpConn     *net.UDPConn
+	udpListener *net.UDPConn
 	icmpV4Conn  *icmdp.Conn
 	icmpV6Conn  *icmdp.Conn
 
@@ -69,7 +83,7 @@ func (s *Server) acceptTcpConn(listener *net.TCPListener) {
 			s.err = err
 			return
 		}
-		go s.handleTcpConn(conn)
+		go s.handleTcpConn(s.config.Obfuscator.ObfuStreamConn(conn))
 	}
 }
 
@@ -96,6 +110,7 @@ func (s *Server) handlePacketConn(conn net.PacketConn) {
 	if pooh.IsNil(conn) {
 		return
 	}
+	conn = s.config.Obfuscator.ObfuPacketConn(conn)
 	buf := make([]byte, pooh.BufferSize)
 	for {
 		if s.closeOnce.Done() {
@@ -153,7 +168,7 @@ func (s *Server) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (s *Server) close() error {
-	return pooh.Close(s.tcpListener, s.udpConn, s.icmpV4Conn, s.icmpV6Conn)
+	return pooh.Close(s.tcpListener, s.udpListener, s.icmpV4Conn, s.icmpV6Conn)
 }
 
 func (s *Server) Close() error {

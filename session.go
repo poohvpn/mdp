@@ -64,7 +64,7 @@ func (s *session) mostRecentEndpoint() (res *endpoint) {
 	return
 }
 
-func (s *session) dial(network string, remote *Addr) (err error) {
+func (s *session) dial(network string, remote *Addr, ob Obfuscator) (err error) {
 	var conn net.Conn
 	switch network {
 	case "tcp4", "tcp6":
@@ -72,7 +72,7 @@ func (s *session) dial(network string, remote *Addr) (err error) {
 			IP:   remote.IP,
 			Port: remote.Port,
 			Zone: remote.Zone,
-		}, s.id)
+		}, s.id, ob)
 	case "udp4", "udp6":
 		conn, err = net.DialUDP("udp", nil, &net.UDPAddr{
 			IP:   remote.IP,
@@ -107,7 +107,8 @@ func (s *session) dial(network string, remote *Addr) (err error) {
 	}
 	switch network {
 	case "udp4", "udp6", "icmdp4", "icmdp6":
-		conn = &clientPacketConn{
+		conn = ob.ObfuDatagramConn(conn)
+		conn = &clientDatagramConn{
 			Conn: conn,
 			id:   s.id,
 		}
