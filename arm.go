@@ -66,23 +66,23 @@ type rawPacket struct {
 }
 
 type Obfuscator interface {
-	ObfuPacketConn(conn net.PacketConn) net.PacketConn
-	ObfuStreamConn(conn net.Conn) net.Conn
-	ObfuDatagramConn(conn net.Conn) net.Conn
+	ObfuscatePacketConn(conn net.PacketConn) net.PacketConn
+	ObfuscateStreamConn(conn net.Conn) net.Conn
+	ObfuscateDatagramConn(conn net.Conn) net.Conn
 }
 
 type nopObfuscator struct{}
 
 var _ Obfuscator = nopObfuscator{}
 
-func (o nopObfuscator) ObfuPacketConn(conn net.PacketConn) net.PacketConn {
+func (o nopObfuscator) ObfuscatePacketConn(conn net.PacketConn) net.PacketConn {
 	return conn
 }
 
-func (o nopObfuscator) ObfuDatagramConn(conn net.Conn) net.Conn {
+func (o nopObfuscator) ObfuscateDatagramConn(conn net.Conn) net.Conn {
 	return conn
 }
 
-func (o nopObfuscator) ObfuStreamConn(conn net.Conn) net.Conn {
+func (o nopObfuscator) ObfuscateStreamConn(conn net.Conn) net.Conn {
 	return conn
 }

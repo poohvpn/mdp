@@ -83,7 +83,7 @@ func (s *Server) acceptTcpConn(listener *net.TCPListener) {
 			s.err = err
 			return
 		}
-		go s.handleTcpConn(s.config.Obfuscator.ObfuStreamConn(conn))
+		go s.handleTcpConn(s.config.Obfuscator.ObfuscateStreamConn(conn))
 	}
 }
 
@@ -110,7 +110,7 @@ func (s *Server) handlePacketConn(conn net.PacketConn) {
 	if pooh.IsNil(conn) {
 		return
 	}
-	conn = s.config.Obfuscator.ObfuPacketConn(conn)
+	conn = s.config.Obfuscator.ObfuscatePacketConn(conn)
 	buf := make([]byte, pooh.BufferSize)
 	for {
 		if s.closeOnce.Done() {

@@ -14,7 +14,7 @@ func dialTcpDatagram(addr *net.TCPAddr, id uint32, ob Obfuscator) (conn *tcpData
 		return
 	}
 	conn = &tcpDatagram{
-		Conn: pooh.NewConn(ob.ObfuStreamConn(tcpConn), true),
+		Conn: pooh.NewConn(ob.ObfuscateStreamConn(tcpConn), true),
 	}
 	err = conn.Conn.WriteUint32(id)
 	if err != nil {

@@ -107,7 +107,7 @@ func (s *session) dial(network string, remote *Addr, ob Obfuscator) (err error) 
 	}
 	switch network {
 	case "udp4", "udp6", "icmdp4", "icmdp6":
-		conn = ob.ObfuDatagramConn(conn)
+		conn = ob.ObfuscateDatagramConn(conn)
 		conn = &clientDatagramConn{
 			Conn: conn,
 			id:   s.id,
